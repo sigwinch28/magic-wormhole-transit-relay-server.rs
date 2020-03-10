@@ -200,6 +200,7 @@ name = "magic-wormhole-transit-relay-rs"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "lazy_static",
  "regex",
  "tokio",
  "tokio-util",

@@ -1,9 +1,8 @@
-use std::collections::{HashMap};
-use std::convert::TryInto;
+use std::collections::HashMap;
 use std::env;
 use std::error::Error;
-use std::sync::{Arc};
-use std::net::SocketAddr;
+use std::sync::Arc;
+//use std::net::SocketAddr;
 
 use futures::channel::oneshot;
 use futures::SinkExt;
@@ -13,57 +12,39 @@ extern crate lazy_static;
 
 use regex::{Regex, RegexBuilder};
 
-use tokio;
+use stream_cancel::{StreamExt as CancelStreamExt, TakeUntil, Tripwire};
+
+use tokio::prelude::*;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::stream::StreamExt;
+use tokio::io::BufReader;
+use tokio::stream::{StreamExt};
 use tokio::sync::Mutex;
-use tokio_util::codec::{Framed, FramedRead, FramedWrite, LinesCodec, LinesCodecError};
+use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, BytesCodec};
 
-const HANDSHAKE_REGEX : &str = r"^please relay (?P<token>\w{64}) for side (?P<side>\w{16})$";
-const TOKEN_SIZE : usize = 64;
-const SIDE_SIZE : usize = 16;
+const HANDSHAKE_REGEX_TXT : &str = r"^please relay (?P<token>\w{64}) for side (?P<side>\w{16})$";
+//const TOKEN_SIZE : usize = 64;
+//const SIDE_SIZE : usize = 16;
 
-
-struct Buddy<T> {
-    my_rx: oneshot::Sender<io::ReadHalf<T>>,
-    their_rx: oneshot::Receiver<io::ReadHalf<T>>,
-    my_done: oneshot::Sender<()>,
-    their_done: oneshot::Receiver<()>,
+lazy_static! {
+    static ref HANDSHAKE_REGEX : Regex = RegexBuilder::new(HANDSHAKE_REGEX_TXT)
+	.size_limit(10 * (1 << 21))
+	.build()
+	.unwrap();
 }
-
-impl<T> Buddy<T> {
-    fn new_pair() -> (Self, Self) {
-	let (rx_one_send, rx_one_recv) = oneshot::channel();
-	let (rx_two_send, rx_two_recv) = oneshot::channel();
-	let (done_one_send, done_one_recv) = oneshot::channel();
-	let (done_two_send, done_two_recv) = oneshot::channel();
-	let buddy_one = Self {
-	    my_rx: rx_one_send,
-	    their_rx: rx_two_recv,
-	    my_done: done_one_send,
-	    their_done: done_two_recv,
-	};
-	let buddy_two = Self {
-	    my_rx: rx_two_send,
-	    their_rx: rx_one_recv,
-	    my_done: done_two_send,
-	    their_done: done_one_recv,
-	};
-	(buddy_one, buddy_two)
-    }
-}
-
-
-type BuddyChannel<T> = oneshot::Sender<Buddy<T>>;
 
 type Token = Vec<u8>;
 type Side = Vec<u8>;
 
-struct Server<T> {
-    waiting: HashMap<Token, HashMap<Side, BuddyChannel<T>>>
+enum Buddy<T> {
+    NotHere(oneshot::Receiver<(io::ReadHalf<T>, io::WriteHalf<T>)>),
+    Here(oneshot::Sender<(io::ReadHalf<T>, io::WriteHalf<T>)>),
 }
+
+struct Server<T> {
+    waiting: HashMap<Token, HashMap<Side, oneshot::Sender<(io::ReadHalf<T>, io::WriteHalf<T>)>>>,
+}
+
 
 impl<T> Server<T> {
     fn new() -> Self {
@@ -72,24 +53,20 @@ impl<T> Server<T> {
 	}
     }
 
-    fn add_connection(&mut self, token: Token, side: Side, new_ch: BuddyChannel<T>) -> Result<(), Box<dyn Error>> {
+    fn add_connection(&mut self, token: Token, side: Side) -> Result<Buddy<T>, Box<dyn Error>> {
 	let old_conns = self.waiting.entry(token).or_insert(HashMap::new());
 	let old_side = old_conns.keys().find(|k| **k != side).map(|k| k.clone());
 	match old_side {
 	    Some(old_side) => {
 		let old_ch = old_conns.remove(&old_side).unwrap();
-
-		let (old, new) = Buddy::new_pair();
-		
-
-		new_ch.send(new).map_err(|_| "couldn't send to new conn")?;
-		old_ch.send(old).map_err(|_| "couldn't send to old conn")?;
+		Ok(Buddy::Here(old_ch))
 	    },
 	    None => {
-		old_conns.insert(side, new_ch);
+		let (send, recv) = oneshot::channel();
+		old_conns.insert(side, send);
+		Ok(Buddy::NotHere(recv))
 	    }
 	}
-	Ok(())
     }
 }
 
@@ -112,60 +89,63 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
         // Spawn our handler to be run asynchronously.
         tokio::spawn(async move {
-	    match process(server, stream, addr).await {
-		Ok(bytes) => {
-		    println!("{} closed cleanly after sending {} bytes", addr, bytes)
-		},
-		Err(e) =>
-		    println!("error occurred with {}: {:?}", addr, e)	
+	    if let Err(e) = process(server, stream).await {
+		println!("error occurred with {}: {:?}", addr, e)	
 	    }
         });
     }
 }
 
-async fn process<T>(server: Arc<Mutex<Server<T>>>, stream: T, addr: SocketAddr) -> Result<u64, Box<dyn Error>>
-where T: AsyncReadExt + AsyncWriteExt {
-    let (my_rx, my_tx) = io::split(stream);
-    let mut lines_rx  = FramedRead::new(my_rx, LinesCodec::new());
-    let mut lines_tx = FramedWrite::new(my_tx, LinesCodec::new());
+async fn process<T>(server: Arc<Mutex<Server<T>>>, stream: T) -> Result<(), Box<dyn Error>>
+where T: AsyncRead + AsyncWrite {
+    let (rx, tx) = io::split(stream);
+    let rx_buf = BufReader::new(rx);
+    //let mut rx_lines = FramedRead::new(rx, LinesCodec::new());
 
-    let line = match lines_rx.next().await {
-	Some(Ok(line)) => line,
-	_ => return Err("bad line".into())
-    };
+    let mut line = String::new();
+    let a = rx_buf.take(1024);
+    let b = a.read_line(&mut line).await?;
 
-    lazy_static! {
-	static ref RE : Regex = RegexBuilder::new(HANDSHAKE_REGEX)
-	    .size_limit(10 * (1 << 21))
-	    .build()
-	    .unwrap();
-    }
-    let caps = RE.captures(&line).ok_or("bad handshake")?;
+    let caps = HANDSHAKE_REGEX.captures(&line).ok_or("bad handshake")?;
     let token = caps["token"].into();
     let side = caps["side"].into();
-   
-    let (ch, buddy) = oneshot::channel();
+
+    let buddy;
     {
-    	let mut server = server.lock().await;
-    	server.add_connection(token, side, ch)?;
+     	let mut server = server.lock().await;
+    	buddy = server.add_connection(token, side)?;
     }
 
-    let buddy = buddy.await.map_err(|_| "redundant")?;
-    let my_rx = lines_rx.into_inner();
-
-    buddy.my_rx.send(my_rx).map_err(|_| "couldn't send buddy our rx")?;
-    let mut buddy_rx = buddy.their_rx.await?;
-    lines_tx.send("ok").await?;
-
-    let mut my_tx = lines_tx.into_inner();
-
-    tokio::select!{
-	bytes = io::copy(&mut buddy_rx, &mut my_tx) => {
-	    buddy.my_done.send(()).map_err(|_| "couldn't tell buddy we're done")?;
-	    Ok(bytes.unwrap_or(0))
+    let (mut my_rx, mut my_tx) = (rx_buf.into_inner(), tx);
+    match buddy {
+	Buddy::Here(ch) => {
+	    ch.send((my_rx, my_tx)).map_err(|_| "couldn't send stream to buddy")?;
+	    Ok(())
 	},
-	_ = buddy.their_done => {
-	    Ok(0)
+	Buddy::NotHere(ch) => {
+	    let (mut buddy_rx, mut buddy_tx) = ch.await?;
+	    my_tx.write("ok\n".as_bytes()).await?;
+	    buddy_tx.write("ok\n".as_bytes()).await?;
+	    let us_to_buddy = io::copy(&mut my_rx, &mut buddy_tx);
+	    let buddy_to_us = io::copy(&mut buddy_rx, &mut my_tx);
+
+	    tokio::try_join!(us_to_buddy, buddy_to_us)?;
+	    Ok(())
 	}
     }
+
+    // let buddy = buddy.await.map_err(|_| "redundant")?;
+    // let (trigger, tripwire) = Tripwire::new();
+    // let rx_bytes = FramedRead::new(rx_lines.into_inner(), BytesCodec::new())
+    // 	.take_until(tripwire);
+
+    // buddy.my_rx.send(rx_bytes).map_err(|_| "couldn't send buddy our rx")?;
+    // let mut buddy_rx = buddy.their_rx.await?;
+    // tx_lines.send("ok").await?;
+
+    // let mut my_tx = tx_lines.into_inner();
+
+    // io::copy(&mut buddy_rx, &mut my_tx);
+	
+    // Ok(0)
 }
